@@ -1,0 +1,929 @@
+%tensorflow_version 1.x
+import tensorflow
+print(tensorflow.__version__)
+from __future__ import division
+import numpy as np
+import scipy.io as sio
+import scipy.misc as sc
+import glob
+from PIL import Image
+import PIL
+from imageio import imread,imwrite
+
+# WHU Dataset
+def prepare_images():
+
+      # Parameters
+      height = 512
+      width  = 512
+      channels = 3
+
+      # Prepare dataset 
+      Dataset_add = '/content/sample_data/dataset_WHU/'
+      Tr_add = 'WHU_Image_Input'
+
+      Tr_list = glob.glob(Dataset_add+ Tr_add+'/*.tif')
+     
+      print('Reading WHU')
+      print(len(Tr_list))
+      for idx in range(len(Tr_list)):
+        try:
+          
+          print(idx+1)
+          img = imread(Tr_list[idx])
+          img = np.double(np.array(Image.fromarray(img).resize(size = (height, width),resample = PIL.Image.BILINEAR)))
+
+          b = Tr_list[idx]  
+          #print('Initially b=',b)  
+          a = b[0:len(Dataset_add)]
+          b = b[len(b)-8: len(b)-4] 
+          #print('a=',a)
+          #print('b=',b)
+          add = (a+ 'WHU_GroundTruth/' + b +'.tif')
+          #print('add=',add)    
+          img2 = imread(add)
+          #img2 = np.double(np.array(Image.fromarray(img2).resize(size = (height, width),resample = PIL.Image.BILINEAR)))
+          img2 = Image.fromarray(img2).resize(size = (height, width),resample = PIL.Image.BILINEAR)
+          img2 =  np.double(np.array(np.reshape(img2.convert('L'), (512,512,1)))) 
+          img = img.astype(np.uint8)
+          img2 = img2.astype(np.uint8)
+
+          if (idx < 85):                                            
+            folder = 'Train/'
+          elif (85 <= idx < 85+20):
+            folder = 'Test/'
+          else:
+            folder = 'Valid/'
+
+            # save train data
+          imwrite(Dataset_add + 'Img/'+ folder + b + '.png',img)
+          imwrite(Dataset_add + 'Mask/'+ folder + b +'_segmentation.png',img2)
+
+        except Exception as e:
+          print(e)
+          print('error in img {}'.format(idx+1))
+      
+      print('Reading WHU finished')
+
+prepare_images()
+%%writefile load_data.py
+import numpy as np
+import glob
+import scipy
+import random
+import cv2
+import imageio
+#from PIL import Image
+
+def load_batch(images, labels, shape=64, channels=3, h_flip=True, vflip=True, rotation=True):
+    x1, y1 = [], []
+    for x, y in zip(images, labels):
+        # Load images
+        #img = Image.open(x)
+        #lab = Image.open(y)
+        img = imageio.imread(x)
+        lab = imageio.imread(y)
+        # Augmentation
+        img, lab = data_augmentation(img, lab, h_flip, vflip, rotation)
+        # Reshape
+       
+        
+       # lab=np.reshape(lab.convert('L'), (shape,shape,1)) 
+        lab = lab.reshape(shape, shape, 1)
+        img = img.reshape(shape, shape, channels)
+        # Mask verification
+        lab[lab > 0.5] = 1
+        lab[lab <= 0.5] = 0
+        # Store
+        x1.append(img / 255.0)
+        y1.append(lab)
+    return x1, np.array(y1).astype(np.float32)
+
+
+def prepare_data():
+    
+    img = np.array(sorted(glob.glob(r'/content/sample_data/dataset_WHU/Img/Train/*.png')))
+    label = np.array(sorted(glob.glob(r'/content/sample_data/dataset_WHU/Mask/Train/*.png')))
+    test_img = np.array(sorted(glob.glob(r'/content/sample_data/dataset_WHU/Img/Valid/*.png')))
+    test_label = np.array(sorted(glob.glob(r'/content/sample_data/dataset_WHU/Mask/Valid/*.png')))
+    return img, label, test_img, test_label
+
+
+def data_augmentation(image, label, h_flip, vflip, rotation):
+    # Data augmentation
+
+    if h_flip and random.randint(0, 1):
+        image = np.fliplr(image)
+        label = np.fliplr(label)
+
+    if vflip and random.randint(0, 1):
+        image = np.flipud(image)
+        label = np.flipud(label)
+
+    if rotation and random.randint(0, 1):
+        angle = random.randint(0, 3)*90
+        if angle != 0:
+            M = cv2.getRotationMatrix2D(
+                (image.shape[1] // 2, image.shape[0] // 2), angle, 1.0)
+            image = cv2.warpAffine(
+                image, M, (image.shape[1], image.shape[0]), flags=cv2.INTER_NEAREST)
+            label = cv2.warpAffine(
+                label, M, (label.shape[1], label.shape[0]), flags=cv2.INTER_NEAREST)
+
+    return image, label
+    #MODEL
+%%writefile mapnetmodel.py
+##!pip install tensorflow-AutoGraphError
+#%tensorflow_version 1.x
+import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+
+
+def conv2d(input,filters,kernel_size=3,stride=1,padding='SAME'):
+    return tf.layers.conv2d(input,filters=filters,kernel_size=kernel_size,
+                            padding=padding,strides=stride,use_bias=False,
+                            kernel_initializer=tf.variance_scaling_initializer())
+
+
+def bn(input,is_training=True):
+    return tf.layers.batch_normalization(input,momentum=0.99,epsilon=1e-3,training=is_training)
+
+
+def bottleneck(x, size,is_training,downsampe=False):
+    residual = x
+    out = bn(x, is_training)
+    out = tf.nn.relu(out)
+    out = conv2d(out, size, 1, padding='VALID')
+    out = bn(out, is_training)
+    out = tf.nn.relu(out)
+    out = conv2d(out, size, 3)
+    out = bn(out, is_training)
+    out = tf.nn.relu(out)
+    out = conv2d(out, size * 4, 1, padding='VALID')
+
+    if downsampe:
+        residual = bn(x, is_training)
+        residual = tf.nn.relu(residual)
+        residual = conv2d(residual, size * 4, 1, padding='VALID')
+    out = tf.add(out,residual)
+    return out
+
+
+def resblock(x, size,is_training):
+    residual = x
+
+    out = bn(x, is_training)
+    out = tf.nn.relu(out)
+    out = conv2d(out, size, 3)
+    out = bn(out, is_training)
+    out = tf.nn.relu(out)
+    out = conv2d(out, size, 3)
+
+    out = tf.add(out, residual)
+    return out
+
+
+def stage0(x,is_training):
+    x = bottleneck(x, 64,is_training, downsampe=True)
+    x = bottleneck(x, 64,is_training)
+    x = bottleneck(x, 64,is_training)
+    x = bottleneck(x, 64,is_training)
+    return x
+
+
+def translayer(x, in_channels, out_channels,is_training):
+    num_in = len(in_channels)
+    num_out = len(out_channels)
+    out = []
+    for i in range(num_out):
+        if i < num_in:
+            residual = bn(x[i], is_training)
+            residual = tf.nn.relu(residual)
+            residual = conv2d(residual, out_channels[i], 3)
+            out.append(residual)
+        else:
+            residual = bn(x[-1], is_training)
+            residual = tf.nn.relu(residual)
+            residual = conv2d(residual, out_channels[i], 3, stride=2)
+            out.append(residual)
+    return out
+
+
+def convb(x, block_num, channels,is_training):
+    out = []
+    for i in range(len(channels)):
+        residual = x[i]
+        for j in range(block_num):
+            residual = resblock(residual, channels[i],is_training)
+        out.append(residual)
+    return out
+
+
+def featfuse(x, channels, is_training, multi_scale_output=True):
+    out = []
+    for i in range(len(channels) if multi_scale_output else 1):
+        residual = x[i]
+        for j in range(len(channels)):
+            if j > i:
+                if multi_scale_output == False:
+                    y = bn(x[j], is_training)
+                    y = tf.nn.relu(y)
+                    y = conv2d(y, channels[j], 1, padding='VALID')
+                    out.append(tf.keras.layers.UpSampling2D(size=2 ** (j - i))(y))
+                else:
+                    y = bn(x[j], is_training)
+                    y = tf.nn.relu(y)
+                    y = conv2d(y, channels[i], 1, padding='VALID')
+                    y = tf.keras.layers.UpSampling2D(size=2 ** (j - i))(y)
+                    residual = tf.add(residual, y)
+
+            elif j < i:
+                y = x[j]
+                for k in range(i - j):
+                    if k == i - j - 1:
+                        y = bn(y, is_training)
+                        y = tf.nn.relu(y)
+                        y = conv2d(y, channels[i], 1)
+                        y = tf.layers.max_pooling2d(y, 2, 2)
+
+                    else:
+                        y = bn(y, is_training)
+                        y = tf.nn.relu(y)
+                        y = conv2d(y, channels[j], 1)
+                        y = tf.layers.max_pooling2d(y, 2, 2)
+
+                residual = tf.add(residual, y)
+        out.append(residual)
+    return out
+
+
+def convblock(x, channels,is_training, multi_scale_output=True):
+    residual = convb(x, 4, channels,is_training)
+    out = featfuse(residual, channels,is_training, multi_scale_output=multi_scale_output)
+    return out
+
+
+def stage(x, num_modules, channels, is_training,multi_scale_output=True):
+    out = x
+    for i in range(num_modules):
+        if i == num_modules - 1 and multi_scale_output == False:
+            out = convblock(out, channels,is_training, multi_scale_output=False)
+        else:
+            out = convblock(out, channels,is_training)
+    return out
+
+
+def pyramid_pooling_block(input, bin_sizes):
+    pool_list = []
+    h = input.shape[1]
+    c = input.shape[-1]
+    for bin_size in bin_sizes:
+        pool1 = tf.layers.average_pooling2d(input, (h // bin_size, h // bin_size), (h // bin_size, h // bin_size))
+        pool1 = conv2d(pool1, int(c)//4, 1)
+        pool1 = tf.image.resize_bilinear(pool1, (h, h))
+        pool_list.append(pool1)
+    pool = tf.concat(pool_list, axis=3)
+    return tf.add(input, pool)
+
+
+def spatial_pooling(input):
+    h,w=input.shape[1],input.shape[2]
+    p1=tf.image.resize_bilinear(tf.layers.max_pooling2d(input,2,2),(h,w))
+    p2 = tf.image.resize_bilinear(tf.layers.max_pooling2d(input, 3, 3), (h, w))
+    p3=tf.image.resize_bilinear(tf.layers.max_pooling2d(input,5,5),(h,w))
+    p4 = tf.image.resize_bilinear(tf.layers.max_pooling2d(input, 6, 6), (h, w))
+    p=tf.concat([p1,p2,p3,p4,input],axis=-1)
+    return p
+
+
+def channel_squeeze(input,filters,name=" "):
+    with tf.name_scope(name):
+        squeeze=tf.reduce_mean(input,axis=[1,2])
+        with tf.name_scope(name+"fc1"):
+            fc1=tf.layers.dense(squeeze,use_bias=True,units=filters)
+            fc1=tf.nn.relu(fc1)
+        with tf.name_scope(name+"fc2"):
+            fc2=tf.layers.dense(fc1,use_bias=True,units=filters)
+            fc2=tf.nn.sigmoid(fc2)
+        result=tf.reshape(fc2,[-1,1,1,filters])
+        return input*result
+
+
+def mapnet(input, is_training=True):
+    channels_s2 = [64, 128]
+    channels_s3 = [64, 128, 256]
+    num_modules_s2 = 2
+    num_modules_s3 = 3
+
+    conv_1 = conv2d(input, 64, stride=2)
+    conv_1 = bn(conv_1, is_training)
+    conv_1 = tf.nn.relu(conv_1)
+    conv_2 = conv2d(conv_1, 64)
+    conv_2 = bn(conv_2, is_training)
+    conv_2 = tf.nn.relu(conv_2)
+    conv_3 = conv2d(conv_2, 64)
+    conv_3 = bn(conv_3, is_training)
+    conv_3 = tf.nn.relu(conv_3)
+    conv_4 = tf.layers.max_pooling2d(conv_3, 2, 2)
+
+    stage1 = stage0(conv_4,is_training)
+    trans1 = translayer([stage1], [256], channels_s2,is_training)
+    stage2 = stage(trans1, num_modules_s2, channels_s2,is_training)
+    trans2 = translayer(stage2, channels_s2, channels_s3,is_training)
+    stage3 = stage(trans2, num_modules_s3, channels_s3,is_training,multi_scale_output=False)
+
+    stg3=tf.concat(stage3,axis=-1)
+    squeeze=channel_squeeze(stg3, stg3.shape[-1], name="squeeze")
+
+    spatial=tf.concat([stage3[0],stage3[1]],axis=-1)
+    # spatial=pyramid_pooling_block(spatial, [1, 2, 4, 8])
+    spatial=spatial_pooling(spatial)
+
+    new_feature = tf.concat([spatial, squeeze], axis=-1)
+    new_feature = bn(new_feature, is_training)
+    new_feature = tf.nn.relu(new_feature)
+    result=conv2d(new_feature, 128, 1, padding='SAME')
+
+    up1=tf.image.resize_bilinear(result,size=(stage3[0].shape[1]*2,stage3[0].shape[2]*2))
+    up1 = bn(up1, is_training)
+    up1 = tf.nn.relu(up1)
+    up1 = conv2d(up1, 64, 3)
+
+    up2 = tf.image.resize_bilinear(up1, size=(up1.shape[1]*2, up1.shape[2]*2))
+    up2 = bn(up2, is_training)
+    up2 = tf.nn.relu(up2)
+    up2 = conv2d(up2, 32, 3)
+
+    up2 = bn(up2, is_training)
+    up2 = tf.nn.relu(up2)
+    final = conv2d(up2, 1, 1, padding='valid')
+
+    return final
+    #TRAIN
+import os
+import time
+# import utils
+%tensorflow_version 1.x
+import tensorflow as tf
+import numpy as np
+import skimage.io as io
+import imageio
+import argparse
+import scipy
+import scipy.misc
+#import mapnetmodel
+#import load_data
+#import tensorflow.compat.v1 as tf
+#tf.disable_v2_behavior()
+
+from load_data import load_batch,prepare_data
+from mapnetmodel import mapnet
+
+
+#Helper Functions
+def scores(predict, label):
+    tp = np.sum(np.logical_and(predict == 1, label == 1))
+    tn = np.sum(np.logical_and(predict == 0, label == 0))
+    fp = np.sum(np.logical_and(predict == 1, label == 0))
+    fn = np.sum(np.logical_and(predict == 0, label == 1))
+    
+    intersection = tp
+    union = fp + fn + tp
+
+    return intersection, union, tp, tn, fp, fn 
+  
+def make_mask(im):
+    im[im < 0.5] = 0
+    im[im >= 0.5] = 1
+    return im
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-f')
+#Hyperparameters
+parser.add_argument('--batch_size', type=int, default=4, help='Number of images in each batch')
+parser.add_argument('--learning_rate', type=float, default=0.001, help='Number of images in each batch')
+parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs to train for')
+#Input Size
+parser.add_argument('--crop_height', type=int, default=512, help='Height of cropped input image to network')
+parser.add_argument('--crop_width', type=int, default=512, help='Width of cropped input image to network')
+parser.add_argument('--clip_size', type=int, default=450, help='Width of cropped input image to network')
+parser.add_argument('--channels', type=int, default=3, help="Number of channels in the input image")
+#Data Augmentation
+parser.add_argument('--h_flip', type=bool, default=True, help='Whether to randomly flip the image horizontally for data augmentation')
+parser.add_argument('--v_flip', type=bool, default=True, help='Whether to randomly flip the image vertically for data augmentation')
+parser.add_argument('--color', type=bool, default=True, help='Whether to randomly flip the image vertically for data augmentation')
+parser.add_argument('--rotation', type=bool, default=True, help='randomly rotate, the imagemax rotation angle in degrees.')
+#Validation
+parser.add_argument('--start_valid', type=int, default=0, help='Number of epoch to valid')
+parser.add_argument('--valid_step', type=int, default=1, help="Number of step to validation")
+#Checkpoint
+parser.add_argument('--checkpoint_load_path', type=str, default='/content/sample_data/checkpoint/', help="Folder to load checkpoints from")
+parser.add_argument('--checkpoint_save_path', type=str, default='/content/sample_data/checkpoint/', help="Folder where to save checkpoints")
+
+parser.add_argument('--save_mask_train', action='store_true', help="Save a mask during training")
+
+args = parser.parse_args()
+
+#Load Data
+num_images=[]
+train_img, train_label,valid_img,valid_lab= prepare_data()
+num_batches=len(train_img)//(args.batch_size)
+
+#Placeholders
+img=tf.placeholder(tf.float32,[None, args.crop_height, args.crop_width, args.channels])
+is_training=tf.placeholder(tf.bool)
+label=tf.placeholder(tf.float32,[None,args.crop_height, args.crop_height,1])
+
+pred=mapnet(img,is_training)
+pred1=tf.nn.sigmoid(pred)
+
+#Loss and Optimizer
+update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+with tf.control_dependencies(update_ops):
+
+    sig=tf.nn.sigmoid_cross_entropy_with_logits(labels=label, logits=pred)
+    sigmoid_cross_entropy_loss = tf.reduce_mean(sig)
+    train_step = tf.train.AdamOptimizer(args.learning_rate).minimize(sigmoid_cross_entropy_loss)
+
+
+saver = tf.train.Saver(var_list=tf.global_variables())
+#print('Total number of global variables {0}'.format(len(tf.compat.v1.global_variables()))) 
+#print(tf.__version__)
+
+
+#Load Checkpoints
+def load():
+    import re
+    print("Reading checkpoints...")
+    checkpoint_dir = args.checkpoint_load_path
+    ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+
+    if ckpt and ckpt.model_checkpoint_path:
+        ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+        saver.restore(sess, os.path.join(checkpoint_dir, ckpt_name))
+        counter = int(next(re.finditer("(\d+)(?!.*\d)", ckpt_name)).group(0))
+        print("Checkpoint {} read successfull".format(ckpt_name))
+        return True, counter
+    else:
+        print("Checkpoint not found")
+        return False, 0
+
+def train():
+    #Intialize
+    tf.global_variables_initializer().run()
+    train_iter=[]
+    train_loss=[]
+    loss_tmp = []
+    IOU=0.65
+
+    #Loading Checkpoints
+    could_load, checkpoint_counter = load()
+    if could_load:
+        print(f"checkpoint counter: {checkpoint_counter} num_batches: {num_batches}")
+        print("Total train image:{}".format(len(train_img)))
+        start_epoch = (int)(checkpoint_counter / num_batches)
+        start_batch_id = checkpoint_counter - start_epoch * num_batches
+        counter = checkpoint_counter
+        print("Checkpoint Load Successed")
+
+    else:
+        start_epoch = 0
+        start_batch_id = 0
+        counter = 1
+        print("train from scratch...")
+
+
+    #Print Information
+    print("Total train image:{}".format(len(train_img)))
+    print("Total validate image:{}".format(len(valid_img)))
+    print("Total epoch:{}".format(args.num_epochs))
+    print("Batch size:{}".format(args.batch_size))
+    print("Learning rate:{}".format(args.learning_rate))
+    print(f"Image shape: {args.crop_width} x {args.crop_height} x {args.channels}")
+    print("Data Argument:")
+    print("h_flip: {}".format(args.h_flip))
+    print("v_flip: {}".format(args.v_flip))
+    print("rotate: {}".format(args.rotation))
+    print("clip size: {}".format(args.clip_size))
+    
+    #Epoch
+    for i in range(start_epoch, args.num_epochs):
+        epoch_time=time.time()
+        id_list = np.random.permutation(len(train_img))
+
+        #Batch
+        for j in range(start_batch_id, num_batches):
+            img_d = []
+            lab_d = []
+            
+            #Load
+            for ind in range(args.batch_size):
+                id = id_list[j * args.batch_size + ind]
+                img_d.append(train_img[id])
+                lab_d.append(train_label[id])
+            
+
+            x_batch, y_batch = load_batch(img_d, lab_d, shape=args.crop_height, channels=args.channels, h_flip=args.h_flip, vflip=args.v_flip, rotation=args.rotation)
+            feed_dict = {img: x_batch,
+                         label: y_batch,
+                         is_training:True
+                         }
+
+            #Train
+            _, loss, pred1 = sess.run([train_step, sigmoid_cross_entropy_loss, pred], feed_dict=feed_dict)
+
+            #Save Mask
+            if args.save_mask_train and (j % 10 == 0):
+                Image.fromarray(np.squeeze(make_mask(pred1[1]))*255.).convert("L").save('result_thresh_train.png')
+            
+            #Print Loss
+            loss_tmp.append(loss)
+            
+            if (counter % 10 == 0):
+                
+                tmp = np.median(loss_tmp)
+                train_iter.append(counter)
+                train_loss.append(tmp)
+                print('Epoch', i, '|Iter', counter, '|Loss', tmp)
+                loss_tmp.clear()
+
+            counter += 1
+        start_batch_id = 0
+        print('Time:', time.time() - epoch_time)
+
+        #saver.save(sess, './checkpoint/model.ckpt', global_step=counter)
+
+        #Validation
+        if (i>args.start_valid):
+            if (i-args.start_valid)%args.valid_step==0:
+                val_iou, precision, recall, f1, accuracy, specificity = validation()
+                print(f"Last IOU value: {IOU:0.3f}")
+                print(f"New IOU value: {val_iou:0.3f}")
+                print(f'New Precision: {precision:0.3f}, Recall: {recall:0.3f}, F1: {f1:0.3f}, Accuracy: {accuracy:0.3f}, Specificity: {specificity:0.3f}')
+                
+                if val_iou > IOU:
+                    print("Save the checkpoint...")
+                    saver.save(sess, args.checkpoint_save_path + 'model_best.ckpt',
+                            global_step=counter, write_meta_graph=True)
+                    IOU = val_iou
+    print(args.checkpoint_save_path)
+    saver.save(sess, args.checkpoint_save_path + 'model_current.ckpt', global_step=counter)
+
+
+def validation():
+    print("Start validation...")
+    inter, unin, tp, tn, fp, fn = 0, 0, 0, 0, 0, 0
+
+    for j in range(0, len(valid_img)):
+        # Load image    
+        x_batch = imageio.imread(valid_img[j]) / 255.0
+
+        # Reshape
+        if args.channels == 1:
+            x_batch = x_batch[np.newaxis, :, :, np.newaxis]
+        elif args.channels == 3:
+            x_batch = x_batch[np.newaxis, :, :, :]
+
+        # Inference
+        feed_dict = {img: x_batch,
+                     is_training: False
+                     }
+        predict = sess.run(pred1, feed_dict=feed_dict)
+        
+         # Mask
+        result = (make_mask(predict))
+        
+        # Get groud truth
+        gt_value = make_mask(imageio.imread(valid_lab[j]))
+        
+        # Scores
+        intersection, union, tp_, tn_, fp_, fn_  = scores(gt_value, result)
+        tp, tn, fn, fp = tp + tp_, tn + tn_, fn + fn_, fp + fp_
+        inter, unin = inter + intersection, unin + union
+
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+    f1 = (2 * precision * recall) / (precision + recall)
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    specificity = tn / (tn + fp)
+
+    return inter*1.0 / unin, precision, recall, f1, accuracy, specificity
+
+with tf.Session() as sess:
+    train()
+    from __future__ import division
+import numpy as np
+import scipy.io as sio
+import scipy.misc as sc
+import glob
+from PIL import Image
+import PIL
+from imageio import imread,imwrite
+
+# WHU Dataset
+def prepare_images():
+
+      # Parameters
+      height = 512
+      width  = 512
+      channels = 3
+
+      # Prepare dataset 
+      Dataset_add = '/content/sample_data/'
+      Tr_add = 'IIRS_Test'
+
+      Tr_list = glob.glob(Dataset_add+ Tr_add+'/*.png')
+     
+      print('Reading Dataset')
+      print(len(Tr_list))
+      for idx in range(len(Tr_list)):
+        try:
+          
+          print(idx+1)
+          img = imread(Tr_list[idx])
+          img = Image.fromarray(img).resize(size = (height, width),resample = PIL.Image.BILINEAR)
+          img =  np.double(np.array(np.reshape(img.convert('RGB'), (512,512,3)))) 
+          b = Tr_list[idx]  
+          #print('Initially b=',b)  
+          #a = b[0:len(Dataset_add)]
+          b = b[len(b)-8: len(b)-4] 
+          #print('a=',a)
+          #print('b=',b)
+          #add = (a+ 'WHU_GroundTruth/' + b +'.tif')
+          #print('add=',add)    
+          #img2 = imread(add)
+          #img2 = np.double(np.array(Image.fromarray(img2).resize(size = (height, width),resample = PIL.Image.BILINEAR)))
+          #img2 = Image.fromarray(img2).resize(size = (height, width),resample = PIL.Image.BILINEAR)
+          #img2 =  np.double(np.array(np.reshape(img2.convert('L'), (512,512,1)))) 
+          img = img.astype(np.uint8)
+          #img2 = img2.astype(np.uint8)
+
+          if (idx < 72):                                            
+            folder = 'Train/'
+          elif (72 <= idx < 72+18):
+            folder = 'Test/'
+          else:
+            folder = 'Valid/'
+
+            # save train data
+          imwrite(Dataset_add + 'Img/'+ folder + b + '.png',img)
+          #imwrite(Dataset_add + 'Mask/'+ folder + b +'_segmentation.png',img2)
+
+        except Exception as e:
+          print(e)
+          print('error in img {}'.format(idx+1))
+      
+      print('Reading dataset finished')
+
+prepare_images()
+#TEST
+
+import scipy
+%tensorflow_version 1.x
+import tensorflow as tf
+import os
+import numpy as np
+import glob
+import argparse
+from PIL import Image
+import PIL
+
+from imageio import imread, imwrite
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+from mapnetmodel import mapnet
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-f')
+#Hyperparameters
+parser.add_argument('--test_img_path', type=str, default='/content/sample_data/Img/Train/',
+                    help="Image test folder")
+parser.add_argument('--test_result_path', type=str, default='/content/sample_data/IIRS_results/',
+                    help="Test results folder")  
+parser.add_argument('--checkpoint_dir', type=str, default='/content/sample_data/checkpoint',
+                    help="Checkpoint folder")  
+parser.add_argument('--crop_size', type=int, default=512,
+                    help='size of cropped input image to network')
+parser.add_argument('--channels', type=int, default=3,
+                    help="Number of channels in the input image")  
+args = parser.parse_args()
+
+print(tf.__version__)
+
+batch_size = 1
+img = tf.placeholder(tf.float32, [batch_size, args.crop_size, args.crop_size, args.channels])
+
+test_img = sorted(
+    glob.glob(r'{}'.format(args.test_img_path) + r'*.png'))
+
+test_results_path = args.test_result_path
+
+pred = mapnet(img, is_training=False)
+pred = tf.nn.sigmoid(pred)
+#print('Total number of global variables {0}'.format(len(tf.compat.v1.global_variables()))) 
+saver = tf.train.Saver(tf.global_variables())
+
+#https://www.tensorflow.org/api_docs/python/tf/train/Checkpoint
+#https://www.tensorflow.org/guide/checkpoint
+def save():
+    tf.global_variables_initializer().run()
+    checkpoint_dir = args.checkpoint_dir
+    ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+    if ckpt and ckpt.model_checkpoint_path:
+        ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+        saver.restore(sess, os.path.join(checkpoint_dir, ckpt_name))
+
+    for j in range(0, len(test_img)):
+        x_batch = test_img[j]
+        i = x_batch.split('/')[-1]
+        x_batch = imread(x_batch) 
+        x_batch = np.double(np.array(Image.fromarray(x_batch).resize(size = (args.crop_size, args.crop_size),resample = PIL.Image.BILINEAR)))
+        x_batch /= 255.0
+        x_batch = np.expand_dims(x_batch, axis=0)
+        if args.channels == 1:
+            feed_dict = {img: np.expand_dims(x_batch, axis=3)}
+        else:
+            feed_dict = {img: x_batch}
+        predict = sess.run(pred, feed_dict=feed_dict)
+        predict[predict < 0.5] = 0
+        predict[predict >= 0.5] = 1
+        result = np.squeeze(predict)
+        i = i.split('.')[0]
+        imwrite(test_results_path + '{}.png'.format(i), (result * 255.0).astype(np.uint8))
+
+with tf.Session() as sess:
+    save()
+    from __future__ import division
+import os
+import numpy as np
+import scipy
+import matplotlib.pyplot as plt
+import glob
+from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import jaccard_similarity_score
+from sklearn.metrics import f1_score
+from imageio import imread
+from PIL import Image
+import PIL
+
+def evaluate_data(img_path = "/content/sample_data/dataset_WHU/Img/Test/", test_results_path = "/content/sample_data/test_results/", output_folder = "/content/sample_data/Output/", test_mask_path = "/content/sample_data/dataset_WHU/Mask/Test/"):
+    test_results = sorted(glob.glob(r'{}'.format(test_results_path) + r'*.png'))
+    y_true = []
+    y_scores = []
+    te_data = []
+    print(len(test_results))
+    for j in range(0, len(test_results)):
+        x_batch = test_results[j]
+        img_name = x_batch.split('/')[-1]
+        img_name = img_name.split('.')[0]
+        # read img
+        true_img = imread(img_path + img_name +'.png')
+        true_img = np.double(np.array(Image.fromarray(true_img).resize(size = (512, 512),resample = PIL.Image.BILINEAR)))
+        true_img = true_img.astype(np.uint8)
+        #read result mask
+        result_mask = imread(test_results[j])
+        result_mask = result_mask / 255.0
+        #read true mask
+        true_mask = imread(test_mask_path + img_name +'_segmentation.png')
+        true_mask = np.double(np.array(Image.fromarray(true_mask).resize(size = (512, 512),resample = PIL.Image.BILINEAR)))
+        true_mask = true_mask / 255.0
+        
+
+        y_scores.append(result_mask)
+        y_true.append(true_mask)
+        te_data.append(true_img)
+    
+    print('Dataset loaded')
+    predictions = np.array(y_scores)
+    y_scores = predictions.reshape(-1,1)
+    print(y_scores.shape)
+
+    te_mask = np.array(y_true)
+    y_true = te_mask.reshape(-1,1)
+    print(y_true.shape)
+
+
+    y_scores = np.where(y_scores>0.5, 1, 0)
+    y_true   = np.where(y_true>0.5, 1, 0)
+
+    #Area under the ROC curve
+    fpr, tpr, thresholds = roc_curve((y_true), y_scores)
+    AUC_ROC = roc_auc_score(y_true, y_scores)
+    print ("\nArea under the ROC curve: " +str(AUC_ROC))
+    ROC_curve =plt.figure()
+    plt.plot(fpr,tpr,'-',label='Area Under the Curve (AUC = %0.4f)' % AUC_ROC)
+    plt.title('ROC curve')
+    plt.xlabel("FPR (False Positive Rate)")
+    plt.ylabel("TPR (True Positive Rate)")
+    plt.legend(loc="lower right")
+    plt.savefig(output_folder+"ROC.png")
+
+    #Precision-recall curve
+    precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+    precision = np.fliplr([precision])[0] 
+    recall = np.fliplr([recall])[0]
+    AUC_prec_rec = np.trapz(precision,recall)
+    print ("\nArea under Precision-Recall curve: " +str(AUC_prec_rec))
+    prec_rec_curve = plt.figure()
+    plt.plot(recall,precision,'-',label='Area Under the Curve (AUC = %0.4f)' % AUC_prec_rec)
+    plt.title('Precision - Recall curve')
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.legend(loc="lower right")
+    plt.savefig(output_folder+"Precision_recall.png")
+
+    #Confusion matrix
+    threshold_confusion = 0.5
+    print ("\nConfusion matrix:  Custom threshold (for positive) of " +str(threshold_confusion))
+    y_pred = np.empty((y_scores.shape[0]))
+    for i in range(y_scores.shape[0]):
+        if y_scores[i]>=threshold_confusion:
+            y_pred[i]=1
+        else:
+            y_pred[i]=0
+    confusion = confusion_matrix(y_true, y_pred)
+    print (confusion)
+    accuracy = 0
+    if float(np.sum(confusion))!=0:
+        accuracy = float(confusion[0,0]+confusion[1,1])/float(np.sum(confusion))
+    print ("Global Accuracy: " +str(accuracy))
+    specificity = 0
+    if float(confusion[0,0]+confusion[0,1])!=0:
+        specificity = float(confusion[0,0])/float(confusion[0,0]+confusion[0,1])
+    print ("Specificity: " +str(specificity))
+    sensitivity = 0
+    if float(confusion[1,1]+confusion[1,0])!=0:
+        sensitivity = float(confusion[1,1])/float(confusion[1,1]+confusion[1,0])
+    print ("Sensitivity: " +str(sensitivity))
+    precision = 0
+    if float(confusion[1,1]+confusion[0,1])!=0:
+        precision = float(confusion[1,1])/float(confusion[1,1]+confusion[0,1])
+    print ("Precision: " +str(precision))
+
+    #Jaccard similarity index
+    jaccard_index = jaccard_similarity_score(y_true, y_pred, normalize=True)
+    print ("\nJaccard similarity score: " +str(jaccard_index))
+
+    #F1 score
+    F1_score = f1_score(y_true, y_pred, labels=None, average='binary', sample_weight=None)
+    print ("\nF1 score (F-measure): " +str(F1_score))
+
+    #Save the results
+    file_perf = open(output_folder+'performances.txt', 'w')
+    file_perf.write("Area under the ROC curve: "+str(AUC_ROC)
+                    + "\nArea under Precision-Recall curve: " +str(AUC_prec_rec)
+                    + "\nJaccard similarity score: " +str(jaccard_index)
+                    + "\nF1 score (F-measure): " +str(F1_score)
+                    +"\n\nConfusion matrix:"
+                    +str(confusion)
+                    +"\nACCURACY: " +str(accuracy)
+                    +"\nSENSITIVITY: " +str(sensitivity)
+                    +"\nSPECIFICITY: " +str(specificity)
+                    +"\nPRECISION: " +str(precision)
+                    )
+    file_perf.close()
+
+    # Save 10 results with error rate lower than threshold
+    threshold = 200
+    predictions = np.where(predictions>0.5, 1, 0)
+    te_mask     = np.where(te_mask>0.5, 1, 0)
+    good_prediction = np.zeros([predictions.shape[0],1], np.uint8)
+    id_m = 0
+    for idx in range(predictions.shape[0]):
+        esti_sample = predictions[idx]
+        true_sample = te_mask[idx]
+        esti_sample = esti_sample.reshape(-1, 1)
+        true_sample = true_sample.reshape(-1, 1)
+        er = 0
+        for idy in range(true_sample.shape[0]):
+            if esti_sample[idy] != true_sample[idy]:
+              er = er +1
+        if er <threshold:
+          good_prediction[id_m] = idx    
+          id_m += 1   
+
+    fig,ax = plt.subplots(10,3,figsize=[20,20])
+
+    for idx in range(10):
+        original_image = np.double(np.array(Image.fromarray(te_data[good_prediction[idx,0]]).resize(size = (512, 512),resample = PIL.Image.BILINEAR)))
+        ax[idx, 0].imshow(np.uint8(original_image))
+        if idx == 0:
+          ax[idx, 0].set_title('Original Image')
+        true_mask = np.double(np.array(Image.fromarray((te_mask[good_prediction[idx,0]]*255.0).astype(np.uint8)).resize(size = (512, 512),resample = PIL.Image.BILINEAR)))
+        ax[idx, 1].imshow(np.uint8(true_mask), cmap='gray')
+        if idx == 0:
+          ax[idx, 1].set_title('True Mask')
+        predicted_mask = np.double(np.array(Image.fromarray((predictions[good_prediction[idx,0]]*255.0).astype(np.uint8)).resize(size = (512, 512),resample = PIL.Image.BILINEAR)))
+        ax[idx, 2].imshow(np.uint8(predicted_mask), cmap='gray')
+        if idx == 0:
+          ax[idx, 2].set_title('Predicted Mask')
+
+    plt.savefig(output_folder+'sample_results.png')
+
+
+evaluate_data()
